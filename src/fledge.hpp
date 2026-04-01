@@ -3,6 +3,7 @@
 // config.hpp must come first — NEST_SERIALIZABLE(Config, ...) must be
 // visible before driver.hpp instantiates nest_visit_fields on Config.
 #include "config.hpp"
+#include "mt/binary_evolution.hpp"
 #include "physics.hpp"
 #include "state.hpp"
 
@@ -51,22 +52,87 @@ public:
     void initial_state(State& s) const override {
         s.time = config().tstart;
         s.iteration = 0;
-        auto [mpos, mvel, m] = setup_masses(config());
-        s.mass_positions = std::move(mpos);
-        s.mass_velocities = std::move(mvel);
-        masses_ = std::move(m);
-        auto [pos, vel] = setup_particles(config(), s.mass_positions,
-                                          s.mass_velocities, masses_);
-        s.positions = std::move(pos);
-        s.velocities = std::move(vel);
+
+        if (config().simulation_mode == "mass_transfer") {
+            const auto& mtcfg = ensure_mt_config();
+            s.mt = init_binary_mt(mtcfg);
+
+            auto [r_d, r_a] = binary_positions(s.mt);
+            auto [v_d, v_a] = binary_velocities(s.mt);
+            s.mass_positions = {r_d, r_a};
+            s.mass_velocities = {v_d, v_a};
+            masses_ = {s.mt.donor_mass, s.mt.accretor_mass};
+
+            if (config().num_particles > 0) {
+                auto [pos, vel] = setup_particles(config(), s.mass_positions,
+                                                  s.mass_velocities, masses_);
+                s.positions = std::move(pos);
+                s.velocities = std::move(vel);
+            }
+        } else {
+            auto [mpos, mvel, m] = setup_masses(config());
+            s.mass_positions = std::move(mpos);
+            s.mass_velocities = std::move(mvel);
+            masses_ = std::move(m);
+            auto [pos, vel] = setup_particles(config(), s.mass_positions,
+                                              s.mass_velocities, masses_);
+            s.positions = std::move(pos);
+            s.velocities = std::move(vel);
+        }
     }
 
     void update(State& s) const override {
-        advance_state(s, config(), masses_, config().dt);
+        if (config().simulation_mode == "mass_transfer") {
+            const auto& mtcfg = ensure_mt_config();
+
+            advance_binary(s.mt, mtcfg, config().dt);
+
+            auto [r_d, r_a] = binary_positions(s.mt);
+            auto [v_d, v_a] = binary_velocities(s.mt);
+            s.mass_positions[0] = r_d;
+            s.mass_positions[1] = r_a;
+            s.mass_velocities[0] = v_d;
+            s.mass_velocities[1] = v_a;
+            masses_[0] = s.mt.donor_mass;
+            masses_[1] = s.mt.accretor_mass;
+
+            // Leapfrog KDK for test particles
+            size_t n = s.positions.size();
+            if (n > 0) {
+                double eps = config().softening;
+                size_t mn = 2;
+                double dt = config().dt;
+
+                for (size_t i = 0; i < n; ++i) {
+                    Vec3 a = compute_acceleration(s.positions[i],
+                                 s.mass_positions, masses_, eps, mn);
+                    s.velocities[i] += a * (0.5 * dt);
+                }
+                for (size_t i = 0; i < n; ++i) {
+                    s.positions[i] += s.velocities[i] * dt;
+                }
+                for (size_t i = 0; i < n; ++i) {
+                    Vec3 a = compute_acceleration(s.positions[i],
+                                 s.mass_positions, masses_, eps, mn);
+                    s.velocities[i] += a * (0.5 * dt);
+                }
+            }
+
+            s.time += config().dt;
+            s.iteration++;
+        } else {
+            advance_state(s, config(), masses_, config().dt);
+        }
     }
 
     // ── Timeseries ────────────────────────────────────────────────────
     auto timeseries_columns() const -> std::vector<std::string> override {
+        if (config().simulation_mode == "mass_transfer") {
+            return {"time", "num_particles", "max_radius",
+                    "donor_mass", "accretor_mass", "separation",
+                    "mdot_transfer", "beta", "orbital_period",
+                    "roche_radius", "overflow_depth"};
+        }
         return {"time", "num_particles", "max_radius"};
     }
 
@@ -76,6 +142,20 @@ public:
         for (const auto& p : s.positions) {
             double r = p.mag();
             if (r > max_r) max_r = r;
+        }
+
+        if (config().simulation_mode == "mass_transfer") {
+            return {s.time,
+                    static_cast<double>(s.positions.size()),
+                    max_r,
+                    s.mt.donor_mass,
+                    s.mt.accretor_mass,
+                    s.mt.separation,
+                    s.mt.mdot_transfer,
+                    s.mt.beta,
+                    s.mt.orbital_period,
+                    s.mt.roche_radius,
+                    s.mt.overflow_depth};
         }
         return {s.time,
                 static_cast<double>(s.positions.size()),
@@ -124,6 +204,21 @@ public:
         add_vec3("velocities", s.velocities);
         add_vec3("mass_positions", s.mass_positions);
         add_vec3("mass_velocities", s.mass_velocities);
+
+        if (config().simulation_mode == "mass_transfer") {
+            w.set_scalar("mt_donor_mass", s.mt.donor_mass);
+            w.set_scalar("mt_accretor_mass", s.mt.accretor_mass);
+            w.set_scalar("mt_donor_radius", s.mt.donor_radius);
+            w.set_scalar("mt_separation", s.mt.separation);
+            w.set_scalar("mt_phase", s.mt.phase);
+            w.set_scalar("mt_mdot_transfer", s.mt.mdot_transfer);
+            w.set_scalar("mt_beta", s.mt.beta);
+            w.set_scalar("mt_mdot_loss", s.mt.mdot_loss);
+            w.set_scalar("mt_jloss", s.mt.jloss);
+            w.set_scalar("mt_cumulative_transferred", s.mt.cumulative_transferred);
+            w.set_scalar("mt_cumulative_accreted", s.mt.cumulative_accreted);
+            w.set_scalar("mt_cumulative_lost", s.mt.cumulative_lost);
+        }
     }
 
     void read_state(nest::io::CheckpointReader& r,
@@ -147,18 +242,74 @@ public:
         read_vec3("mass_positions", s.mass_positions);
         read_vec3("mass_velocities", s.mass_velocities);
 
-        // Recompute mass values from config (constant, not checkpointed)
-        auto [mpos, mvel, m] = setup_masses(config());
-        masses_ = std::move(m);
+        if (config().simulation_mode == "mass_transfer") {
+            if (auto v = r.scalar_double("mt_donor_mass")) s.mt.donor_mass = *v;
+            if (auto v = r.scalar_double("mt_accretor_mass")) s.mt.accretor_mass = *v;
+            if (auto v = r.scalar_double("mt_donor_radius")) s.mt.donor_radius = *v;
+            if (auto v = r.scalar_double("mt_separation")) s.mt.separation = *v;
+            if (auto v = r.scalar_double("mt_phase")) s.mt.phase = *v;
+            if (auto v = r.scalar_double("mt_mdot_transfer")) s.mt.mdot_transfer = *v;
+            if (auto v = r.scalar_double("mt_beta")) s.mt.beta = *v;
+            if (auto v = r.scalar_double("mt_mdot_loss")) s.mt.mdot_loss = *v;
+            if (auto v = r.scalar_double("mt_jloss")) s.mt.jloss = *v;
+            if (auto v = r.scalar_double("mt_cumulative_transferred")) s.mt.cumulative_transferred = *v;
+            if (auto v = r.scalar_double("mt_cumulative_accreted")) s.mt.cumulative_accreted = *v;
+            if (auto v = r.scalar_double("mt_cumulative_lost")) s.mt.cumulative_lost = *v;
+
+            recompute_derived(s.mt);
+            masses_ = {s.mt.donor_mass, s.mt.accretor_mass};
+        } else {
+            auto [mpos, mvel, m] = setup_masses(config());
+            masses_ = std::move(m);
+        }
     }
 
     // ── Status ────────────────────────────────────────────────────────
     void print_status(const State& s, double secs_per_update) const override {
-        std::println("[{:06d}] t={:.6e}  {:.3f} sec/update  n={}",
-                     get_iteration(s), get_time(s), secs_per_update,
-                     s.positions.size());
+        if (config().simulation_mode == "mass_transfer") {
+            std::println("[{:06d}] t={:.6e}  {:.3f} sec/update  n={}  "
+                         "M_d={:.6f}  M_a={:.6f}  a={:.6f}  mdot={:.4e}",
+                         get_iteration(s), get_time(s), secs_per_update,
+                         s.positions.size(),
+                         s.mt.donor_mass, s.mt.accretor_mass,
+                         s.mt.separation, s.mt.mdot_transfer);
+        } else {
+            std::println("[{:06d}] t={:.6e}  {:.3f} sec/update  n={}",
+                         get_iteration(s), get_time(s), secs_per_update,
+                         s.positions.size());
+        }
     }
 
 private:
     mutable std::vector<double> masses_;
+    mutable MassTransferConfig mt_config_;
+    mutable bool mt_config_built_ = false;
+
+    auto ensure_mt_config() const -> const MassTransferConfig& {
+        if (!mt_config_built_) {
+            mt_config_.donor_mass0 = config().mt_donor_mass0;
+            mt_config_.accretor_mass0 = config().mt_accretor_mass0;
+            mt_config_.donor_radius0 = config().mt_donor_radius0;
+            mt_config_.separation0 = config().mt_separation0;
+            mt_config_.phase0 = config().mt_phase0;
+            mt_config_.donor_radius_mode = config().mt_donor_radius_mode;
+            mt_config_.zeta_star = config().mt_zeta_star;
+            mt_config_.tau_drive = config().mt_tau_drive;
+            mt_config_.Hp_over_R = config().mt_Hp_over_R;
+            mt_config_.mdot0 = config().mt_mdot0;
+            mt_config_.mdot_cap = config().mt_mdot_cap;
+            mt_config_.mdot_mode = config().mt_mdot_mode;
+            mt_config_.mdot_prescribed = config().mt_mdot_prescribed;
+            mt_config_.beta_mode = config().mt_beta_mode;
+            mt_config_.beta_fixed = config().mt_beta_fixed;
+            mt_config_.kappa = config().mt_kappa;
+            mt_config_.f_disk_outer = config().mt_f_disk_outer;
+            mt_config_.logistic_n = config().mt_logistic_n;
+            mt_config_.jloss_mode = config().mt_jloss_mode;
+            mt_config_.eta_j_fixed = config().mt_eta_j_fixed;
+            mt_config_.max_fractional_change = config().mt_max_fractional_change;
+            mt_config_built_ = true;
+        }
+        return mt_config_;
+    }
 };
