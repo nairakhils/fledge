@@ -79,6 +79,14 @@ target_include_directories(imgui PUBLIC
 target_link_libraries(imgui PUBLIC SDL2::SDL2-static OpenGL::GL)
 target_compile_options(imgui PRIVATE -w)
 
+# ── Physics test executable ────────────────────────────────────────────
+add_executable(fledge_physics_test src/tests/physics_verification.cpp)
+target_link_libraries(fledge_physics_test PRIVATE nest)
+target_include_directories(fledge_physics_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/nest/src
+)
+
 # ── GUI executable ─────────────────────────────────────────────────────
 add_executable(fledge_gui src/gui/main_gui.cpp)
 target_link_libraries(fledge_gui PRIVATE imgui nest)
