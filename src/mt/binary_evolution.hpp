@@ -63,6 +63,16 @@ struct MassTransferConfig {
     double eta_j_fixed = 1.0;
 
     double max_fractional_change = 0.01; // subcycling threshold
+
+    // Tracer launch
+    int parcels_per_step = 10;
+    double launch_vr_fraction = 0.1;   // v_r = f_v * v_orb
+    double opening_angle_deg = 15.0;   // half-opening angle in degrees
+    double l3_fraction = 0.0;          // fraction of mdot_loss launched from L3
+    double donor_sink_radius = 0.0;    // 0 = no sink
+    double accretor_sink_radius = 0.0; // 0 = no sink
+    double launch_offset = 1e-3;       // epsilon offset from exact L2/L3
+    int launch_seed = 42;              // RNG seed for vertical scatter
 };
 
 // ── Binary mass-transfer state ──────────────────────────────────────────
