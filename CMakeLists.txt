@@ -87,6 +87,13 @@ target_include_directories(fledge_physics_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/external/nest/src
 )
 
+# ── Roche geometry test executable ────────────────────────────────────
+add_executable(fledge_roche_test src/mt/roche_test.cpp)
+target_compile_features(fledge_roche_test PRIVATE cxx_std_23)
+target_include_directories(fledge_roche_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
 # ── GUI executable ─────────────────────────────────────────────────────
 add_executable(fledge_gui src/gui/main_gui.cpp)
 target_link_libraries(fledge_gui PRIVATE imgui nest)
