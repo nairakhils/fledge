@@ -101,6 +101,13 @@ target_include_directories(fledge_closure_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
+# ── Binary evolution test executable ──────────────────────────────────
+add_executable(fledge_binary_evolution_test src/mt/binary_evolution_test.cpp)
+target_compile_features(fledge_binary_evolution_test PRIVATE cxx_std_23)
+target_include_directories(fledge_binary_evolution_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
 # ── GUI executable ─────────────────────────────────────────────────────
 add_executable(fledge_gui src/gui/main_gui.cpp)
 target_link_libraries(fledge_gui PRIVATE imgui nest)
