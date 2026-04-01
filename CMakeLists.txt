@@ -101,6 +101,14 @@ target_include_directories(fledge_closure_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
+# ── Mass-transfer verification test executable ───────────────────────
+add_executable(fledge_mt_test src/tests/mass_transfer_verification.cpp)
+target_link_libraries(fledge_mt_test PRIVATE nest)
+target_include_directories(fledge_mt_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/nest/src
+)
+
 # ── Binary evolution test executable ──────────────────────────────────
 add_executable(fledge_binary_evolution_test src/mt/binary_evolution_test.cpp)
 target_compile_features(fledge_binary_evolution_test PRIVATE cxx_std_23)
