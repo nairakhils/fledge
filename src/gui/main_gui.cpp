@@ -144,6 +144,18 @@ static void render_config_panel(App& app) {
     auto& c = app.config;
     bool has_state = app.snapshot.has_state;
 
+    // Simulation mode selector
+    {
+        static const char* modes[] = {"test_particles", "mass_transfer"};
+        int mi = combo_index(c.simulation_mode, modes, 2);
+        if (ImGui::Combo("Simulation Mode", &mi, modes, 2)) {
+            c.simulation_mode = modes[mi];
+            if (has_state && app.handle)
+                app.handle->send(fledge::CmdDestroyState{});
+        }
+        ImGui::Separator();
+    }
+
     if (ImGui::CollapsingHeader("Physics", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::InputDouble("tstart", &c.tstart, 0, 0, "%.4g");
         ImGui::InputDouble("tfinal", &c.tfinal, 0, 0, "%.4g");
@@ -151,7 +163,8 @@ static void render_config_panel(App& app) {
         ImGui::InputDouble("softening", &c.softening, 0, 0, "%.4g");
     }
 
-    if (ImGui::CollapsingHeader("Central Object", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (c.simulation_mode != "mass_transfer" &&
+        ImGui::CollapsingHeader("Central Object", ImGuiTreeNodeFlags_DefaultOpen)) {
         static const char* obj_types[] = {"single", "binary", "triple"};
         int idx = combo_index(c.central_object_type, obj_types, 3);
         if (ImGui::Combo("Type", &idx, obj_types, 3))
@@ -221,6 +234,62 @@ static void render_config_panel(App& app) {
         buf[sizeof(buf) - 1] = '\0';
         if (ImGui::InputText("output_dir", buf, sizeof(buf)))
             c.output_dir = buf;
+    }
+
+    // Mass transfer config (only shown in mass_transfer mode)
+    if (c.simulation_mode == "mass_transfer") {
+        if (has_state) ImGui::BeginDisabled();
+
+        if (ImGui::CollapsingHeader("Mass Transfer", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::DragScalar("donor_mass0", ImGuiDataType_Double,
+                              &c.mt_donor_mass0, 0.01f, nullptr, nullptr, "%.4f");
+            ImGui::DragScalar("accretor_mass0", ImGuiDataType_Double,
+                              &c.mt_accretor_mass0, 0.01f, nullptr, nullptr, "%.4f");
+            ImGui::DragScalar("separation0", ImGuiDataType_Double,
+                              &c.mt_separation0, 0.01f, nullptr, nullptr, "%.4f");
+            ImGui::DragScalar("donor_radius0", ImGuiDataType_Double,
+                              &c.mt_donor_radius0, 0.01f, nullptr, nullptr, "%.4f");
+
+            ImGui::Separator();
+
+            static const char* mdot_modes[] = {"ritter", "capped", "prescribed"};
+            int mdi = combo_index(c.mt_mdot_mode, mdot_modes, 3);
+            if (ImGui::Combo("mdot_mode", &mdi, mdot_modes, 3))
+                c.mt_mdot_mode = mdot_modes[mdi];
+
+            ImGui::InputDouble("Hp_over_R", &c.mt_Hp_over_R, 0, 0, "%.2e");
+            ImGui::InputDouble("mdot0", &c.mt_mdot0, 0, 0, "%.2e");
+            if (c.mt_mdot_mode == "prescribed")
+                ImGui::InputDouble("mdot_prescribed", &c.mt_mdot_prescribed, 0, 0, "%.4e");
+
+            ImGui::Separator();
+
+            static const char* beta_modes[] = {"fixed", "super_eddington"};
+            int bi = combo_index(c.mt_beta_mode, beta_modes, 2);
+            if (ImGui::Combo("beta_mode", &bi, beta_modes, 2))
+                c.mt_beta_mode = beta_modes[bi];
+            if (c.mt_beta_mode == "fixed") {
+                double lo = 0.0, hi = 1.0;
+                ImGui::SliderScalar("beta_fixed", ImGuiDataType_Double,
+                                    &c.mt_beta_fixed, &lo, &hi, "%.3f");
+            }
+
+            static const char* jloss_modes[] = {"L2_exact", "scherbak_adiabatic", "fixed_eta"};
+            int ji = combo_index(c.mt_jloss_mode, jloss_modes, 3);
+            if (ImGui::Combo("jloss_mode", &ji, jloss_modes, 3))
+                c.mt_jloss_mode = jloss_modes[ji];
+            if (c.mt_jloss_mode == "fixed_eta") {
+                double lo = 0.0, hi = 2.0;
+                ImGui::SliderScalar("eta_j_fixed", ImGuiDataType_Double,
+                                    &c.mt_eta_j_fixed, &lo, &hi, "%.3f");
+            }
+
+            ImGui::Separator();
+            ImGui::InputDouble("zeta_star", &c.mt_zeta_star, 0, 0, "%.4f");
+            ImGui::InputDouble("tau_drive", &c.mt_tau_drive, 0, 0, "%.2e");
+        }
+
+        if (has_state) ImGui::EndDisabled();
     }
 }
 
@@ -394,9 +463,18 @@ static void render_footer(App& app) {
     ImGui::PopStyleColor();
 
     if (has_state) {
-        ImGui::Text("[%06lld] t=%.6e",
-                    static_cast<long long>(app.snapshot.iteration),
-                    app.snapshot.time);
+        if (app.snapshot.mt.active) {
+            auto& m = app.snapshot.mt;
+            ImGui::Text("[%06lld] t=%.4f  Md=%.4f  Ma=%.4f  a=%.4f  mdot=%.2e",
+                        static_cast<long long>(app.snapshot.iteration),
+                        app.snapshot.time,
+                        m.donor_mass, m.accretor_mass, m.separation,
+                        m.mdot_transfer);
+        } else {
+            ImGui::Text("[%06lld] t=%.6e",
+                        static_cast<long long>(app.snapshot.iteration),
+                        app.snapshot.time);
+        }
     }
 }
 
