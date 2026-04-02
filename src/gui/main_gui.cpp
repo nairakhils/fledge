@@ -14,11 +14,14 @@
 
 #include "interactive/worker.hpp"
 #include "config.hpp"
+#include "mt/roche.hpp"
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <format>
+#include <numbers>
 #include <optional>
 #include <string>
 #include <vector>
@@ -64,6 +67,149 @@ static auto combo_index(const std::string& val, const char* const* items, int co
     return 0;
 }
 
+// ── Rolling buffer for time-history plots ────────────────────────────────
+
+struct RollingBuffer {
+    std::vector<double> time;
+    std::vector<double> data;
+    size_t max_size = 5000;
+
+    void push(double t, double val) {
+        time.push_back(t);
+        data.push_back(val);
+        if (time.size() > max_size) {
+            time.erase(time.begin());
+            data.erase(data.begin());
+        }
+    }
+    void clear() { time.clear(); data.clear(); }
+    auto size() const -> int { return static_cast<int>(time.size()); }
+    auto empty() const -> bool { return time.empty(); }
+};
+
+// ── Marching squares contour extraction ──────────────────────────────────
+
+struct LineSegment { double x1, y1, x2, y2; };
+
+static auto marching_squares(const std::vector<double>& grid, int nx, int ny,
+                             double x0, double y0, double dx, double dy,
+                             double level) -> std::vector<LineSegment>
+{
+    std::vector<LineSegment> segs;
+    auto idx = [nx](int ix, int iy) { return iy * nx + ix; };
+
+    auto lerp_x = [&](int ix, int iy0, int iy1) -> double {
+        (void)iy1;
+        return x0 + ix * dx;
+    };
+    (void)lerp_x;
+
+    for (int iy = 0; iy < ny - 1; ++iy) {
+        for (int ix = 0; ix < nx - 1; ++ix) {
+            double v00 = grid[idx(ix,   iy)]   - level;
+            double v10 = grid[idx(ix+1, iy)]   - level;
+            double v11 = grid[idx(ix+1, iy+1)] - level;
+            double v01 = grid[idx(ix,   iy+1)] - level;
+
+            int config_bits = 0;
+            if (v00 > 0) config_bits |= 1;
+            if (v10 > 0) config_bits |= 2;
+            if (v11 > 0) config_bits |= 4;
+            if (v01 > 0) config_bits |= 8;
+
+            if (config_bits == 0 || config_bits == 15) continue;
+
+            // Edge midpoints with linear interpolation
+            double cx = x0 + ix * dx;
+            double cy = y0 + iy * dy;
+
+            // Bottom edge: (ix,iy)-(ix+1,iy)
+            double bx = cx + dx * (-v00) / (v10 - v00);
+            double by = cy;
+            // Right edge: (ix+1,iy)-(ix+1,iy+1)
+            double rx = cx + dx;
+            double ry = cy + dy * (-v10) / (v11 - v10);
+            // Top edge: (ix,iy+1)-(ix+1,iy+1)
+            double tx = cx + dx * (-v01) / (v11 - v01);
+            double ty = cy + dy;
+            // Left edge: (ix,iy)-(ix,iy+1)
+            double lx = cx;
+            double ly = cy + dy * (-v00) / (v01 - v00);
+
+            auto add = [&](double ax, double ay, double bxx, double byy) {
+                segs.push_back({ax, ay, bxx, byy});
+            };
+
+            switch (config_bits) {
+                case  1: case 14: add(bx,by, lx,ly); break;
+                case  2: case 13: add(bx,by, rx,ry); break;
+                case  3: case 12: add(lx,ly, rx,ry); break;
+                case  4: case 11: add(rx,ry, tx,ty); break;
+                case  5: add(bx,by, rx,ry); add(lx,ly, tx,ty); break;
+                case  6: case  9: add(bx,by, tx,ty); break;
+                case  7: case  8: add(lx,ly, tx,ty); break;
+                case 10: add(bx,by, lx,ly); add(rx,ry, tx,ty); break;
+            }
+        }
+    }
+    return segs;
+}
+
+// ── Roche contour cache ─────────────────────────────────────────────────
+
+struct RocheCache {
+    double cached_q = -1.0;
+    double cached_a = -1.0;
+    std::vector<LineSegment> contour;
+
+    // Recompute if q or a changed significantly
+    void update(double M_d, double M_a, double a) {
+        double q = M_d / M_a;
+        if (cached_a > 0 && std::abs(q - cached_q) / q < 0.001 &&
+            std::abs(a - cached_a) / cached_a < 0.001)
+            return;
+
+        cached_q = q;
+        cached_a = a;
+
+        double M_tot = M_d + M_a;
+        double x_d = -M_a / M_tot * a;
+        double x_a =  M_d / M_tot * a;
+        double Omega2 = M_tot / (a * a * a);
+
+        // Phi_eff at L1
+        double xi_L1 = find_lagrange_L1(q);
+        double xL1_com = (xi_L1 - M_a / M_tot) * a;
+        double rd_L1 = std::abs(xL1_com - x_d);
+        double ra_L1 = std::abs(xL1_com - x_a);
+        double phi_L1 = -M_d / rd_L1 - M_a / ra_L1
+                       - 0.5 * Omega2 * xL1_com * xL1_com;
+
+        // Build potential grid
+        constexpr int N = 200;
+        double extent = 2.5 * a;
+        double gx0 = -extent, gy0 = -extent;
+        double gdx = 2.0 * extent / (N - 1);
+        double gdy = 2.0 * extent / (N - 1);
+
+        std::vector<double> grid(N * N);
+        for (int iy = 0; iy < N; ++iy) {
+            double y = gy0 + iy * gdy;
+            for (int ix = 0; ix < N; ++ix) {
+                double x = gx0 + ix * gdx;
+                double rd = std::sqrt((x - x_d) * (x - x_d) + y * y);
+                double ra = std::sqrt((x - x_a) * (x - x_a) + y * y);
+                if (rd < 1e-6 * a) rd = 1e-6 * a;
+                if (ra < 1e-6 * a) ra = 1e-6 * a;
+                grid[iy * N + ix] = -M_d / rd - M_a / ra
+                                   - 0.5 * Omega2 * (x * x + y * y);
+            }
+        }
+
+        contour = marching_squares(grid, N, N, gx0, gy0, gdx, gdy, phi_L1);
+    }
+};
+
 // ── Application state ────────────────────────────────────────────────────
 
 using Clock = std::chrono::steady_clock;
@@ -87,6 +233,30 @@ struct App {
     int64_t speed_base_iter = 0;
     double speed_base_wall = 0.0;
     double iter_per_sec = 0.0;
+
+    // Mass-transfer visualization state
+    bool mt_corotating = true;
+    RocheCache roche_cache;
+    RollingBuffer rb_donor_mass;
+    RollingBuffer rb_accretor_mass;
+    RollingBuffer rb_separation;
+    RollingBuffer rb_roche_radius;
+    RollingBuffer rb_overflow;
+    RollingBuffer rb_mdot;
+    RollingBuffer rb_beta;
+    int64_t mt_last_push_iter = -1;
+
+    void clear_mt_buffers() {
+        rb_donor_mass.clear();
+        rb_accretor_mass.clear();
+        rb_separation.clear();
+        rb_roche_radius.clear();
+        rb_overflow.clear();
+        rb_mdot.clear();
+        rb_beta.clear();
+        mt_last_push_iter = -1;
+        roche_cache.cached_q = -1.0;
+    }
 };
 
 static auto elapsed(const App& app) -> float {
@@ -114,8 +284,12 @@ static void drain_events(App& app) {
         auto lvl = event_log_level(*ev);
         app.log_entries.push_back({ts, lvl, msg});
         app.last_event_msg = msg;
-        if (std::holds_alternative<fledge::EvStateCreated>(*ev))
+        if (std::holds_alternative<fledge::EvStateCreated>(*ev)) {
             app.auto_fit = true;
+            app.clear_mt_buffers();
+        }
+        if (std::holds_alternative<fledge::EvStateDestroyed>(*ev))
+            app.clear_mt_buffers();
     }
 
     // Log iteration status when iteration advances
@@ -135,6 +309,19 @@ static void drain_events(App& app) {
         app.iter_per_sec = (dt > 0.0) ? static_cast<double>(di) / dt : 0.0;
         app.speed_base_iter = snap.iteration;
         app.speed_base_wall = wall;
+    }
+
+    // Push MT rolling buffer data when iteration advances
+    if (snap.mt.active && snap.iteration != app.mt_last_push_iter) {
+        app.mt_last_push_iter = snap.iteration;
+        double t = snap.time;
+        app.rb_donor_mass.push(t, snap.mt.donor_mass);
+        app.rb_accretor_mass.push(t, snap.mt.accretor_mass);
+        app.rb_separation.push(t, snap.mt.separation);
+        app.rb_roche_radius.push(t, snap.mt.roche_radius);
+        app.rb_overflow.push(t, snap.mt.overflow_depth);
+        app.rb_mdot.push(t, snap.mt.mdot_transfer);
+        app.rb_beta.push(t, snap.mt.beta);
     }
 }
 
@@ -290,6 +477,243 @@ static void render_config_panel(App& app) {
         }
 
         if (has_state) ImGui::EndDisabled();
+    }
+}
+
+// ── Mass-transfer binary system view ─────────────────────────────────────
+
+static void render_mt_binary_view(App& app) {
+    auto& snap = app.snapshot;
+    auto& m = snap.mt;
+    if (!m.active) return;
+
+    double a = m.separation;
+    double M_d = m.donor_mass;
+    double M_a = m.accretor_mass;
+    double M_tot = M_d + M_a;
+    double q_d = M_d / M_a;
+    double phase = m.phase;
+    double cp = std::cos(phase);
+    double sp = std::sin(phase);
+
+    // Star positions in COM frame (inertial)
+    double x_d_com = -(M_a / M_tot) * a;
+    double x_a_com =  (M_d / M_tot) * a;
+
+    // Frame toggle
+    ImGui::Checkbox("Corotating frame", &app.mt_corotating);
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
+                       "(uncheck for inertial / spiral view)");
+
+    // Update Roche contour cache
+    app.roche_cache.update(M_d, M_a, a);
+
+    constexpr ImVec4 col_donor   = {1.0f, 0.53f, 0.27f, 0.8f};
+    constexpr ImVec4 col_accretor = {0.4f, 0.67f, 1.0f, 0.8f};
+    constexpr ImVec4 col_tracer  = {1.0f, 1.0f, 1.0f, 0.5f};
+    constexpr ImVec4 col_roche   = {0.6f, 0.6f, 0.6f, 0.6f};
+    constexpr ImVec4 col_lpoint  = {0.9f, 0.9f, 0.2f, 0.8f};
+
+    ImPlot::PushStyleColor(ImPlotCol_PlotBg, ImVec4(0.06f, 0.06f, 0.08f, 1.0f));
+
+    double extent = 2.5 * a;
+    if (ImPlot::BeginPlot("##binary_mt", ImVec2(-1, -1),
+                          ImPlotFlags_Equal | ImPlotFlags_NoTitle)) {
+        ImPlot::SetupAxes("x", "y");
+        if (app.auto_fit) {
+            ImPlot::SetupAxesLimits(-extent, extent, -extent, extent,
+                                    ImPlotCond_Always);
+            app.auto_fit = false;
+        }
+
+        // Roche contour (corotating frame only)
+        if (app.mt_corotating) {
+            for (auto& seg : app.roche_cache.contour) {
+                double xs[] = {seg.x1, seg.x2};
+                double ys[] = {seg.y1, seg.y2};
+                ImPlot::SetNextLineStyle(col_roche, 1.0f);
+                ImPlot::PlotLine("##roche", xs, ys, 2);
+            }
+        }
+
+        // Determine display positions
+        double dx, dy, ax_disp, ay_disp;
+        if (app.mt_corotating) {
+            dx = x_d_com; dy = 0.0;
+            ax_disp = x_a_com; ay_disp = 0.0;
+        } else {
+            dx = x_d_com * cp; dy = x_d_com * sp;
+            ax_disp = x_a_com * cp; ay_disp = x_a_com * sp;
+        }
+
+        // Stars as scatter points
+        ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 7.0f, col_donor, 0);
+        ImPlot::PlotScatter("donor", &dx, &dy, 1);
+        ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 5.0f, col_accretor, 0);
+        ImPlot::PlotScatter("accretor", &ax_disp, &ay_disp, 1);
+
+        // Draw filled circles for stellar radii using ImDrawList
+        auto* draw_list = ImPlot::GetPlotDrawList();
+        {
+            auto p_d = ImPlot::PlotToPixels(dx, dy);
+            double r_d_plot = m.donor_radius;
+            auto p_d_edge = ImPlot::PlotToPixels(dx + r_d_plot, dy);
+            float r_d_px = std::max(6.0f, std::abs(p_d_edge.x - p_d.x));
+            draw_list->AddCircleFilled(p_d, r_d_px,
+                ImGui::ColorConvertFloat4ToU32(ImVec4(1.0f, 0.53f, 0.27f, 0.25f)));
+        }
+
+        // COM marker
+        {
+            double ox = 0.0, oy = 0.0;
+            ImPlot::SetNextMarkerStyle(ImPlotMarker_Plus, 4.0f,
+                                       ImVec4(0.5f, 0.5f, 0.5f, 0.7f), 1.0f);
+            ImPlot::PlotScatter("COM", &ox, &oy, 1);
+        }
+
+        // Lagrange points (corotating frame only)
+        if (app.mt_corotating) {
+            double x_com_frac = M_a / M_tot;
+            double xi_L1 = find_lagrange_L1(q_d);
+            double xi_L2 = find_lagrange_L2(q_d);
+            double xi_L3 = find_lagrange_L3(q_d);
+            double xL1 = (xi_L1 - x_com_frac) * a;
+            double xL2 = (xi_L2 - x_com_frac) * a;
+            double xL3 = (xi_L3 - x_com_frac) * a;
+            double yL = 0.0;
+
+            ImPlot::SetNextMarkerStyle(ImPlotMarker_Diamond, 4.0f, col_lpoint, 1.0f);
+            ImPlot::PlotScatter("##L1", &xL1, &yL, 1);
+            ImPlot::SetNextMarkerStyle(ImPlotMarker_Diamond, 4.0f, col_lpoint, 1.0f);
+            ImPlot::PlotScatter("##L2", &xL2, &yL, 1);
+            ImPlot::SetNextMarkerStyle(ImPlotMarker_Diamond, 4.0f, col_lpoint, 1.0f);
+            ImPlot::PlotScatter("##L3", &xL3, &yL, 1);
+
+            ImPlot::Annotation(xL1, yL, col_lpoint, ImVec2(5, -10), false, "L1");
+            ImPlot::Annotation(xL2, yL, col_lpoint, ImVec2(5, -10), false, "L2");
+            ImPlot::Annotation(xL3, yL, col_lpoint, ImVec2(5, -10), false, "L3");
+        }
+
+        // Tracer particles
+        if (snap.linear.contains("x") && snap.linear.contains("y")) {
+            auto& xs_in = snap.linear.at("x");
+            auto& ys_in = snap.linear.at("y");
+            if (!xs_in.empty()) {
+                if (app.mt_corotating) {
+                    // Transform from inertial to corotating
+                    std::vector<double> cx(xs_in.size()), cy(xs_in.size());
+                    for (size_t i = 0; i < xs_in.size(); ++i) {
+                        cx[i] =  xs_in[i] * cp + ys_in[i] * sp;
+                        cy[i] = -xs_in[i] * sp + ys_in[i] * cp;
+                    }
+                    ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 1.5f, col_tracer, 0);
+                    ImPlot::PlotScatter("tracers", cx.data(), cy.data(),
+                                        static_cast<int>(cx.size()));
+                } else {
+                    ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 1.5f, col_tracer, 0);
+                    ImPlot::PlotScatter("tracers", xs_in.data(), ys_in.data(),
+                                        static_cast<int>(xs_in.size()));
+                }
+            }
+        }
+
+        // Info overlay
+        {
+            auto tl = ImPlot::GetPlotPos();
+            auto sz = ImPlot::GetPlotSize();
+            float ox = tl.x + sz.x - 10.0f;
+            float oy = tl.y + 10.0f;
+            auto txt = std::format(
+                "q = {:.3f}\na = {:.4f}\nR_L = {:.4f}\ndR = {:.2e}\nmdot = {:.2e}\nbeta = {:.3f}",
+                M_a / M_d, a, m.roche_radius, m.overflow_depth,
+                m.mdot_transfer, m.beta);
+            draw_list->AddText(ImVec2(ox - 130.0f, oy),
+                               ImGui::ColorConvertFloat4ToU32(ImVec4(0.7f, 0.7f, 0.7f, 0.8f)),
+                               txt.c_str());
+        }
+
+        ImPlot::EndPlot();
+    }
+
+    ImPlot::PopStyleColor();
+}
+
+// ── Mass-transfer evolution strip charts ─────────────────────────────────
+
+static void render_mt_evolution(App& app) {
+    if (app.rb_donor_mass.empty()) {
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
+                           "No evolution data yet. Run the simulation.");
+        return;
+    }
+
+    constexpr ImVec4 col_orange = {1.0f, 0.6f, 0.2f, 1.0f};
+    constexpr ImVec4 col_blue   = {0.4f, 0.67f, 1.0f, 1.0f};
+    constexpr ImVec4 col_white  = {1.0f, 1.0f, 1.0f, 0.9f};
+    constexpr ImVec4 col_grey   = {0.5f, 0.5f, 0.5f, 0.7f};
+    constexpr ImVec4 col_green  = {0.3f, 0.9f, 0.3f, 0.9f};
+
+    if (ImPlot::BeginSubplots("##evolution", 5, 1, ImVec2(-1, -1),
+                               ImPlotSubplotFlags_LinkAllX)) {
+
+        // Row 1: Masses
+        if (ImPlot::BeginPlot("Masses", ImVec2(-1, 0))) {
+            ImPlot::SetupAxes("", "M", ImPlotAxisFlags_AutoFit, ImPlotAxisFlags_AutoFit);
+            ImPlot::SetNextLineStyle(col_orange, 1.5f);
+            ImPlot::PlotLine("M_donor", app.rb_donor_mass.time.data(),
+                             app.rb_donor_mass.data.data(), app.rb_donor_mass.size());
+            ImPlot::SetNextLineStyle(col_blue, 1.5f);
+            ImPlot::PlotLine("M_accretor", app.rb_accretor_mass.time.data(),
+                             app.rb_accretor_mass.data.data(), app.rb_accretor_mass.size());
+            ImPlot::EndPlot();
+        }
+
+        // Row 2: Orbit — separation and Roche radius
+        if (ImPlot::BeginPlot("Orbit", ImVec2(-1, 0))) {
+            ImPlot::SetupAxes("", "a, R_L", ImPlotAxisFlags_AutoFit, ImPlotAxisFlags_AutoFit);
+            ImPlot::SetNextLineStyle(col_white, 1.5f);
+            ImPlot::PlotLine("separation", app.rb_separation.time.data(),
+                             app.rb_separation.data.data(), app.rb_separation.size());
+            ImPlot::SetNextLineStyle(col_grey, 1.0f);
+            ImPlot::PlotLine("R_L", app.rb_roche_radius.time.data(),
+                             app.rb_roche_radius.data.data(), app.rb_roche_radius.size());
+            ImPlot::EndPlot();
+        }
+
+        // Row 3: Overflow depth
+        if (ImPlot::BeginPlot("Overflow", ImVec2(-1, 0))) {
+            ImPlot::SetupAxes("", "dR", ImPlotAxisFlags_AutoFit, ImPlotAxisFlags_AutoFit);
+            ImPlot::SetNextLineStyle(col_green, 1.5f);
+            ImPlot::PlotLine("overflow_depth", app.rb_overflow.time.data(),
+                             app.rb_overflow.data.data(), app.rb_overflow.size());
+            double zero_x[] = {app.rb_overflow.time.front(), app.rb_overflow.time.back()};
+            double zero_y[] = {0.0, 0.0};
+            ImPlot::SetNextLineStyle(ImVec4(0.5f, 0.5f, 0.5f, 0.4f), 1.0f);
+            ImPlot::PlotLine("##zero", zero_x, zero_y, 2);
+            ImPlot::EndPlot();
+        }
+
+        // Row 4: Transfer rate
+        if (ImPlot::BeginPlot("Transfer Rate", ImVec2(-1, 0))) {
+            ImPlot::SetupAxes("", "mdot", ImPlotAxisFlags_AutoFit, ImPlotAxisFlags_AutoFit);
+            ImPlot::SetNextLineStyle(col_orange, 1.5f);
+            ImPlot::PlotLine("mdot_tr", app.rb_mdot.time.data(),
+                             app.rb_mdot.data.data(), app.rb_mdot.size());
+            ImPlot::EndPlot();
+        }
+
+        // Row 5: Beta
+        if (ImPlot::BeginPlot("Beta", ImVec2(-1, 0))) {
+            ImPlot::SetupAxes("time", "beta",
+                              ImPlotAxisFlags_AutoFit, ImPlotAxisFlags_AutoFit);
+            ImPlot::SetNextLineStyle(col_blue, 1.5f);
+            ImPlot::PlotLine("beta", app.rb_beta.time.data(),
+                             app.rb_beta.data.data(), app.rb_beta.size());
+            ImPlot::EndPlot();
+        }
+
+        ImPlot::EndSubplots();
     }
 }
 
@@ -609,10 +1033,27 @@ int main(int, char**) {
         // Right panel
         ImGui::SameLine();
         ImGui::BeginChild("##right", ImVec2(0, content_h));
-        if (app.show_log)
+        if (app.show_log) {
             render_log(app);
-        else
+        } else if (app.snapshot.mt.active) {
+            if (ImGui::BeginTabBar("##mt_tabs")) {
+                if (ImGui::BeginTabItem("Binary")) {
+                    render_mt_binary_view(app);
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem("Evolution")) {
+                    render_mt_evolution(app);
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem("Particles")) {
+                    render_plot(app);
+                    ImGui::EndTabItem();
+                }
+                ImGui::EndTabBar();
+            }
+        } else {
             render_plot(app);
+        }
         ImGui::EndChild();
 
         // Footer
